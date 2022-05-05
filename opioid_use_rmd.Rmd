@@ -1,0 +1,1529 @@
+---
+title: 'Biostatistics projects: project 2'
+Author: "Yael Rosen Lang, ID 035801901"
+output:
+  rmdformats::readthedown
+---
+```{r setup, include=FALSE, results='asis', message=FALSE, warning=FALSE}
+library(rmdformats)
+knitr::opts_chunk$set(echo = FALSE, message=FALSE, warning=FALSE, results='asis')
+library(ggplot2)
+library(dplyr)
+library(tidyverse)
+library(Hmisc)
+library(survey)
+library(naniar)
+library(broom)
+library(WeightedROC)
+library(caret)
+library(jtools)
+library(pander)
+panderOptions("table.split.cells", Inf)
+```
+# Abstract
+This study's goal is understanding factors and correlates of chronic pain and opioid usage.
+The analysis was performed on the 2020 National Health Interview Survey (NHIS) conducted by the CDC. The survey data was adjusted for age, race/ethnicity, and sex to prevent bias due to sample imbalance.       
+Factors and interactions associated with chronic pain and prescription opioid usage for chronic pain were identified, and prediction models were built and evaluated.   
+Disability and health-related variables were prominent predictors for chronic pain and opioid usage, whereas socio-demographic and life style factors had a minor effect.  
+Our prediction model for chronic pain achieved a sensitivity of 75% and specificity of 77%.  
+Our prediction model for prescription opioid usage achieved a sensitivity of 86% and specificity of 80%. 
+
+
+```{r}
+library("readxl")
+ndata=read.csv(file='F:/My Documents/MPH/Biostatistics_projects/2 Survey/adult20.csv')
+
+#filtering out refused/dont know/not ascertained from vars chronic pain and opioid use
+data<-ndata%>%filter(PAIFRQ3M_A<6)
+data<-data%>% filter(OPDCHRONIC_A<6 | is.na(OPDCHRONIC_A))
+
+#creating outcome variables
+data$cpain[data$PAIFRQ3M_A<3 | data$PAIFRQ3M_A>4]<-0
+data$cpain[data$PAIFRQ3M_A==3 | data$PAIFRQ3M_A==4]<-1
+data$cpain<-factor(data$cpain, levels=c(0,1), labels=c("No", "Yes"))
+
+data$opioid[data$OPDCHRONIC_A != 1]<-0
+data$opioid[is.na(data$OPDCHRONIC_A)]<-0
+data$opioid[data$OPDCHRONIC_A == 1]<-1
+data$opioid<-factor(data$opioid, levels=c(0,1), labels=c("No", "Yes"))
+```
+
+# Data preparation 
+The survey data set consisted of 31,568 respondents. It was imported from excel to R (R Core Team (2020). R: A language and environment for statistical computing. R Foundation for Statistical Computing, Vienna, Austria. URL https://www.R-project.org/.)
+
+```{r}
+#demographics
+names(data)[names(data)=='AGEP_A']<-'age'
+
+data$sex<-data$SEX_A-1
+data$sex<-factor(data$sex, levels=c(0,1), labels=c("Male", "Female"))
+label(data$sex)<-"Sex"
+
+data$age65<-ifelse(data$age<65, 0, 1)
+data$age65<-factor(data$age65, levels=c(0,1), labels=c("under 65", "65+"))
+label(data$age65)<-"65+ years old"
+
+#marital status
+data$married[data$MARITAL_A==1 | data$MARITAL_A==2]<-1
+data$married[data$MARITAL_A>2]<-0
+data$married<-factor(data$married, levels=c(0,1), labels=c("No", "Yes"))
+#summary(data$married)
+
+#family income group
+#unifying levels 3+4
+data$income_grp<-data$INCGRP_A
+data$income_grp[data$INCGRP_A==4]<-3
+data$income_grp[data$INCGRP_A==5]<-4
+data$income_grp<-factor(data$income_grp, levels=c(1,2,3,4), 
+                       labels=c("$0 to $34,999", "$35,000 to $49,999", "$50,000 to $99,999", "$100,000 or greater"))
+
+#military service
+data$veteran[data$AFVET_A==1]<-1
+data$veteran[data$AFVET_A!=1]<-0
+data$veteran<-factor(data$veteran, levels=c(0,1), labels=c("No", "Yes"))
+#summary(data$veteran)
+
+#----------------economic status
+#health insurance coverage
+data$uninsured[data$NOTCOV_A == 2]<-0 #insured
+data$uninsured[data$NOTCOV_A != 2]<-1 #uninsured
+data$uninsured<-factor(data$uninsured, levels=c(0,1), labels=c("No", "Yes"))
+#summary(data$uninsured)
+
+#problems paying medical bills
+#summary(glm(cpain~as.factor(PAYBLL12M_A), family=binomial, na.action=na.omit, data))
+#not ascertained, dont know and refused are not statistically significant, added no "no"
+data$paybill[data$PAYBLL12M_A == 1]<-1 #having problems
+data$paybill[data$PAYBLL12M_A == 2]<-0 #not having problems
+data$paybill[data$PAYBLL12M_A == 7]<-0 
+data$paybill[data$PAYBLL12M_A == 8]<-0 #not ascertained
+data$paybill[data$PAYBLL12M_A == 9]<-0 
+data$paybill<-factor(data$paybill, levels=c(0,1), labels=c("No", "Yes"))
+#summary(data$paybill)
+
+#worry about paying medical bills
+#summary(glm(cpain~as.factor(PAYWORRY_A), family=binomial, na.action=na.omit, data))
+#summary(glm(opioid~as.factor(PAYWORRY_A), family=binomial, na.action=na.omit, data))
+#all levels have very similar estimates for chronic pain but different for opioid
+#unifying levels 2+3 and creating a binary variable yes/no
+data$payworry[data$PAYWORRY_A == 1]<-1
+data$payworry[data$PAYWORRY_A == 2 |data$PAYWORRY_A == 3 | data$PAYWORRY_A == 9]<-0 #not worried
+data$payworry[data$PAYWORRY_A == 7 ]<-NA #refused
+data$payworry<-factor(data$payworry, levels=c(0, 1), labels=c("No", "Yes"))
+#summary(data$payworry)
+
+#worry that your food will run out in the last 30 days?
+#summary(glm(cpain~as.factor(FDSRUNOUT_A), family=binomial, na.action=na.omit, data))
+#summary(glm(opioid~as.factor(FDSRUNOUT_A), family=binomial, na.action=na.omit, data))
+data$foodworry[data$FDSRUNOUT_A==1 | data$FDSRUNOUT_A==2]<-1 #worried
+data$foodworry[data$FDSRUNOUT_A>2]<- 0#not worried
+data$foodworry<-factor(data$foodworry, levels=c(0,1), labels=c("No", "Yes"))
+#summary(data$foodworry)
+
+#home ownership status
+data$home_owner[data$HOUTENURE_A ==1]<-1 #home owner
+data$home_owner[data$HOUTENURE_A!=1]<- 0#not home owner
+data$home_owner<-factor(data$home_owner, levels=c(0,1), labels=c("No", "Yes"))
+#summary(data$home_owner)
+
+
+#------------------------disability and functioning
+#do you have difficulty walking or climbing stairs?
+data$mobility1[data$DIFF_A>4]<-1
+data$mobility1[data$DIFF_A==1]<-1
+data$mobility1[data$DIFF_A==2]<-2
+data$mobility1[data$DIFF_A==3]<-3
+data$mobility1[data$DIFF_A==4]<-3
+data$mobility1<-factor(data$mobility1, levels=c(1,2,3), labels=c("No difficulty", "Some difficulty", "A lot of difficulty/unable"))
+#summary(data$mobility1)
+#summary(glm(cpain~mobility1, family=binomial, na.action=na.omit, data))
+#summary(m)
+
+#do you use equipment to get around?
+data$mobility2[data$EQUIP_A != 1]<-0
+data$mobility2[is.na(data$EQUIP_A)]<-0
+data$mobility2[data$EQUIP_A == 1]<-1
+data$mobility2<-factor(data$mobility2, levels=c(0,1), labels=c("No", "Yes"))
+#summary(data$mobility2)
+
+#communication
+#unifying levels 3 and 4 due to a small number of observations is level 4 (28, 0.01%)
+#data$communicating[is.na(data$COMDIFF_A0)]<-1
+data$communicating[data$COMDIFF_A >4]<-1
+data$communicating[data$COMDIFF_A ==1]<-1
+data$communicating[data$COMDIFF_A ==2]<-2
+data$communicating[data$COMDIFF_A ==3]<-3
+data$communicating[data$COMDIFF_A ==4]<-3
+data$communicating<-factor(data$communicating, levels=c(1,2,3), labels=c("No difficulty", "Some difficulty", "A lot of difficulty/unable"))
+#summary(data$communicating)
+#summary(glm(cpain~communicating, family=binomial, na.action=na.omit, data))
+
+
+#do you have difficulty concentrating or remembering?
+data$cognitive[data$COGMEMDFF_A >4]<-1
+data$cognitive[data$COGMEMDFF_A==1]<-1
+data$cognitive[data$COGMEMDFF_A==2]<-2
+data$cognitive[data$COGMEMDFF_A==3]<-3
+data$cognitive[data$COGMEMDFF_A==4]<-3
+data$cognitive<-factor(data$cognitive, levels=c(1,2,3), labels=c("No difficulty", "Some difficulty", "A lot of difficulty/unable"))
+#summary(data$cognitive)
+#summary(glm(cpain~cognitive, family=binomial, na.action=na.omit, data))
+
+#are you limited in the kind or amount of work you can do?
+data$work_limited[data$SOCWRKLIM_A != 1]<-0
+data$work_limited[is.na(data$SOCWRKLIM_A)]<-0
+data$work_limited[data$SOCWRKLIM_A == 1]<-1
+data$work_limited<-factor(data$work_limited, levels=c(0,1), labels=c("No", "Yes"))
+#summary(data$work_limited)
+
+
+#do you have difficulty participating in social activity?
+data$social_activity[data$SOCSCLPAR_A >4]<-1
+data$social_activity[data$SOCSCLPAR_A==1]<-1
+data$social_activity[data$SOCSCLPAR_A==2]<-2
+data$social_activity[data$SOCSCLPAR_A==3]<-3
+data$social_activity[data$SOCSCLPAR_A==4]<-3
+data$social_activity<-factor(data$social_activity, levels=c(1,2,3), labels=c("No difficulty", "Some difficulty", "A lot of difficulty/unable"))
+#summary(data$social_activity)
+#summary(glm(cpain~social_activity, family=binomial, na.action=na.omit, data))
+
+#Worked last week
+data$work_lastwk[data$EMPWRKLSWK_A != 1]<-0
+data$work_lastwk[is.na(data$EMPWRKLSWK_A)]<-0
+data$work_lastwk[data$EMPWRKLSWK_A == 1]<-1
+data$work_lastwk<-factor(data$work_lastwk, levels=c(0,1), labels=c("No", "Yes"))
+#summary(data$work_lastwk)
+#summary(glm(cpain~work_lastwk, family=binomial, na.action=na.omit, data))
+
+#-----------------------Health
+
+#fatigue- In the last 3 months- how often did you feel very tired or exhausted?
+data$fatigue[data$FGEFRQTRD_A==1]<-1
+data$fatigue[data$FGEFRQTRD_A==2]<-2
+data$fatigue[data$FGEFRQTRD_A==3]<-3
+data$fatigue[data$FGEFRQTRD_A==4]<-3
+data$fatigue[data$FGEFRQTRD_A >4]<-2
+data$fatigue<-factor(data$fatigue, levels=c(1,2,3), labels=c("Never", "Some days", "Most days/Every day"))
+#summary(data$fatigue)
+#summary(glm(cpain~fatigue, family=binomial, na.action=na.omit, data))
+#summary(m)
+
+data$health[data$PHSTAT_A==1]<-1
+data$health[data$PHSTAT_A==2]<-2
+data$health[data$PHSTAT_A==3]<-3
+data$health[data$PHSTAT_A==4]<-4
+data$health[data$PHSTAT_A==5]<-5
+data$health[data$PHSTAT_A >5]<-2
+data$health<-factor(data$health, levels=c(1,2,3,4,5), labels=c("Excellent", "very good", "Good", "Fair", "Poor"))
+#summary(data$health)
+#summary(glm(cpain~health, family=binomial, na.action=na.omit, data))
+
+#accident or injury in the past 3 months
+data$injury[is.na(data$ANYINJURY_A)]<-0 #no injury 
+data$injury[data$ANYINJURY_A == 1]<-1 #had injury
+data$injury[data$ANYINJURY_A != 1]<-0 #no injury 
+data$injury<-factor(data$injury, levels=c(0,1), labels=c("No", "Yes"))
+#summary(data$injury)
+
+#when was the last time you saw a doctor
+#unify all levels (2+3+4) except the first
+#have you seen a doctor in the last 12 months? yes/no
+data$dr_12months[data$LASTDR_A==1]<-1
+data$dr_12months[data$LASTDR_A !=1]<-0
+data$dr_12months<-factor(data$dr_12months, levels=c(0,1), labels=c("No", "Yes"))
+#summary(data$dr_12months)
+
+#was this a wellness visit?
+#224 missing
+data$wellness[data$WELLNESS_A == 1]<-1 #wellness visit
+data$wellness[data$WELLNESS_A != 1]<-0 
+data$wellness[is.na(data$wellness)]<-0 
+data$wellness<-factor(data$wellness, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$wellness)
+
+#how many times have you had urgent care in the past 12 months?
+#224 missing
+#level 1 is not significant, unify it with 0
+data$urgent_care[data$URGNT12MTC_A ==0]<-0
+data$urgent_care[data$URGNT12MTC_A==1]<-0
+data$urgent_care[data$URGNT12MTC_A==2]<-1
+data$urgent_care[data$URGNT12MTC_A==3]<-1
+data$urgent_care[data$URGNT12MTC_A==4]<-2
+data$urgent_care[data$URGNT12MTC_A==5]<-2
+data$urgent_care[data$URGNT12MTC_A >5]<-0
+data$urgent_care<-factor(data$urgent_care, levels=c(0,1,2), labels=c("0-1 time", "2-3 times", "4+ times"))
+
+
+#were you hospitalized overnight in the past 12 months?
+data$hospitalized[data$HOSPONGT_A == 1]<-1 #hospitalized
+data$hospitalized[data$HOSPONGT_A != 1]<-0 
+data$hospitalized<-factor(data$hospitalized, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$hospitalized)
+
+#during the past 12 months have you had delayed medical care because of the cost?
+#176 missing
+data$caredelay[data$MEDDL12M_A == 1]<-1 #delayed care
+data$caredelay[data$MEDDL12M_A != 1]<-0 
+data$caredelay<-factor(data$caredelay, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$caredelay)
+
+#have you had a flu vaccine in the past 12 months?
+data$flu_vaccine[data$SHTFLU12M_A == 1]<-1 #
+data$flu_vaccine[data$SHTFLU12M_A != 1]<-0 
+data$flu_vaccine<-factor(data$flu_vaccine, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$flu_vaccine)
+
+#--------------- mental health
+#anxiety
+#how often do you feel worried, nervous or anxious
+#483 missing
+data$anx_freq[data$ANXFREQ_A==1]<-1
+data$anx_freq[data$ANXFREQ_A==2]<-2
+data$anx_freq[data$ANXFREQ_A==3]<-3
+data$anx_freq[data$ANXFREQ_A==4]<-4
+data$anx_freq[data$ANXFREQ_A==5]<-5
+data$anx_freq[data$ANXFREQ_A >5]<-4
+#data$anx_freq<-factor(data$anx_freq, levels=c(1,2,3,4,5), 
+ #                     labels=c("Daily", "Weekly", "Monthly", "A few times a year", "Never"))
+#summary(data$anx_freq)
+#comparing the levels' estimates, and unify levels that have similar estimates
+#summary(glm(cpain~anx_freq, family=binomial, na.action=na.omit, data))
+#unify  levels for more than weekly (3+4+5) and levels daily+weekly (1+2)
+data$anx_freq[data$ANXFREQ_A==1]<-1
+data$anx_freq[data$ANXFREQ_A==2]<-1
+data$anx_freq[data$ANXFREQ_A>2]<-0
+data$anx_freq<-factor(data$anx_freq, levels=c(0,1), 
+                      labels=c("Less often than weekly", "Daily or weekly"))
+
+#Do you take prescription medication for worried/nervous/anxious feelings?
+#384 missing
+data$anx_med[data$ANXMED_A == 1]<-1 #medication
+data$anx_med[data$ANXMED_A != 1]<-0 #no medication
+data$anx_med<-factor(data$anx_med, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$anx_med)
+
+#level of feelings the last time you felt worried/nervous/anxious
+#9676 missing values, 30%, entered as an additional level 0
+data$anx_level[is.na(data$ANXLEVEL_A)]<-0
+data$anx_level[data$ANXLEVEL_A ==1]<-1
+data$anx_level[data$ANXLEVEL_A==3]<-2
+data$anx_level[data$ANXLEVEL_A==2]<-3
+data$anx_level[data$ANXLEVEL_A>3]<-1
+#data$anx_level<-factor(data$anx_level, levels=c(0, 1,2,3), 
+#                      labels=c("No worry", "A little", Between a little and a lot", "A lot"))
+#summary(data$anx_level)
+#summary(glm(cpain~anx_level, family=binomial, na.action=na.omit, data))
+#unify levels "a little" and "between a little and a lot" (1+2)
+data$anx_level[is.na(data$ANXLEVEL_A)]<-0 #no worry
+data$anx_level[data$ANXLEVEL_A ==1|data$ANXLEVEL_A ==3]<-1 #between a little and a lot
+data$anx_level[data$ANXLEVEL_A==2]<-2 #a lot
+data$anx_level[data$ANXLEVEL_A>3]<-1
+data$anx_level<-factor(data$anx_level, levels=c(0, 1,2), 
+                       labels=c("No worry", "Between a little and a lot", "A lot"))
+
+#----depression
+#how often do you feel depressed
+data$depr_freq[data$DEPFREQ_A ==1]<-1
+data$depr_freq[data$DEPFREQ_A==2]<-2
+data$depr_freq[data$DEPFREQ_A==3]<-3
+data$depr_freq[data$DEPFREQ_A==4]<-4
+data$depr_freq[data$DEPFREQ_A==5]<-5
+data$depr_freq[data$DEPFREQ_A >5]<-5
+#data$depr_freq<-factor(data$depr_freq, levels=c(1,2,3,4,5), 
+ #                     labels=c("Daily", "Weekly", "Monthly", "A few times a year", "Never"))
+#summary(data$depr_freq)
+#summary(glm(cpain~as.factor(depr_freq), family=binomial, na.action=na.omit, data))
+#summary(m)
+#unify levels for less often than weekly(3+4+5) and daily+weekly (1+2)
+data$depr_freq[data$DEPFREQ_A>2]<-0
+data$depr_freq[data$DEPFREQ_A==2 |data$DEPFREQ_A==1]<-1
+data$depr_freq<-factor(data$depr_freq, levels=c(0,1), 
+                      labels=c("Less often than weekly", "Daily or weekly"))
+
+#Do you take prescription medication for depression?
+data$depr_med[data$DEPMED_A == 1]<-1 #medication
+data$depr_med[data$DEPMED_A != 1]<-0 #no medication
+data$depr_med<-factor(data$depr_med, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$depr_med)
+
+#level of feelings the last time you felt depressed
+#17223 missing values, 54% entered as an additional level 0
+data$depr_level[is.na(data$DEPLEVEL_A)]<-0
+data$depr_level[data$DEPLEVEL_A==1]<-1
+data$depr_level[data$DEPLEVEL_A==3]<-2
+data$depr_level[data$DEPLEVEL_A==2]<-3
+data$depr_level[data$DEPLEVEL_A>3]<-1
+#data$depr_level<-factor(data$depr_level, levels=c(0, 1,2,3), 
+ #                      labels=c("No depression", "A little", "Between a little and a lot", "A lot"))
+#summary(data$depr_level)
+#summary(glm(cpain~as.factor(depr_level), family=binomial, na.action=na.omit, data))
+##unify levels "a little" and "between a little and a lot" (1+2)
+data$depr_level[is.na(data$DEPLEVEL_A)]<-0
+data$depr_level[data$DEPLEVEL_A==1 | data$DEPLEVEL_A==2]<-1
+data$depr_level[data$DEPLEVEL_A==3]<-2
+data$depr_level[data$DEPLEVEL_A>3]<-1
+data$depr_level<-factor(data$depr_level, levels=c(0, 1,2), 
+                       labels=c("No depression", "Between a little and a lot", "A lot"))
+#summary(data$depr_level)
+
+#In the last 12 months, have you taken prescription medication for your mental health?
+#missing data: 410. 
+#data$mhrx[is.na(data$DEPMED_A)]<-0
+data$mhrx[data$MHRX_A == 1]<-1 #medication
+data$mhrx[data$MHRX_A  != 1]<-0 #no medication
+data$mhrx[is.na(data$MHRX_A)]<-0 
+data$mhrx<-factor(data$mhrx, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$mhrx)
+
+#in the past 12 months have you delayed getting counseling because of the cost?
+#392 missing
+data$counseldelay[data$MHTHDLY_A == 1]<-1 #delayed care
+data$counseldelay[data$MHTHDLY_A != 1]<-0
+data$counseldelay[is.na(data$MHTHDLY_A)]<-0 
+data$counseldelay<-factor(data$counseldelay, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$counseldelay)
+
+#-------------------life style
+#have you smoked at least 100 cigarettes in your lifetime?
+#582 missing, 2%
+data$cig100[data$SMKEV_A == 1]<-1 #smoker
+data$cig100[data$SMKEV_A != 1]<-0 
+data$cig100<-factor(data$cig100, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$cig100)
+
+#have you had at least one alcoholic drink in your lifetime?
+#600 missing, 2%
+data$onedrink[data$DRKLIFE_A == 1]<-1 #drinker
+data$onedrink[data$DRKLIFE_A != 1]<-0 
+data$onedrink<-factor(data$onedrink, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$onedrink)
+#summary(glm(cpain~onedrink,family=binomial, na.action=na.omit, cdata))
+#est=0.34, intercept = -1.5
+
+#heavy alcohol drinking DRKHVY12M_A
+#10,009 missing values, 32%
+#data$drink_heavy<-data$DRKHVY12M_A
+data$drink_heavy[is.na(data$DRKHVY12M_A)]<-0
+data$drink_heavy[data$DRKHVY12M_A==1]<-1
+data$drink_heavy[data$DRKHVY12M_A!=1]<-0
+data$drink_heavy<-factor(data$drink_heavy, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$drink_heavy)
+#summary(glm(opioid~drink_heavy,family=binomial, na.action=na.omit, data))
+#summary(glm(cpain~drink_heavy,family=binomial, na.action=na.omit, data))
+
+
+#physical activity
+#not ascertained= 1045, coded as 8
+#summary(glm(cpain~as.factor(PA18_02R_A), family=binomial, na.action=na.omit, data))
+#estimates are very close to intercept and each other. 
+#not ascertained is closest to "insufficient" (8+2)
+data$sport[data$PA18_02R_A==1]<-1
+data$sport[data$PA18_02R_A==2]<-1
+data$sport[data$PA18_02R_A==3]<-3
+data$sport[data$PA18_02R_A>3]<-2
+data$sport<-factor(data$sport, levels=c(1,2,3), 
+               labels=c("Inactive","Insufficiently active", "Sufficiently active"))
+#summary(data$sport)
+
+#summary(glm(cpain~as.factor(sport), family=binomial, na.action=na.omit, data))
+#all levels have approximately the same est, this is not a good predictor
+
+
+#sunscreen- how often do you use sunscreen
+#unify levels most of the time+sometimes(2+3)
+  data$sunscreen[data$SUNSCREEN_A==1]<-1
+  data$sunscreen[data$SUNSCREEN_A==2]<-2
+  data$sunscreen[data$SUNSCREEN_A==3]<-2
+  data$sunscreen[data$SUNSCREEN_A==4]<-3
+  data$sunscreen[data$SUNSCREEN_A==5]<-3
+  data$sunscreen[data$SUNSCREEN_A==7 | data$SUNSCREEN_A==9]<-3 #dont know/refused added to "rarely/never"
+  data$sunscreen[data$SUNSCREEN_A==6]<-2
+  data$sunscreen<-factor(data$sunscreen, levels=c(1,2,3), 
+                         labels=c("Always", "Sometimes", "Rarely or never"))
+
+#diabetes prevention
+#aggregating
+#missing=932
+data$dm_pa<-data$ADVACTIVE_A
+data$dm_pa[data$dm_pa>2]<-2
+data$dm_cal<-data$ADVEAT_A
+data$dm_cal[data$dm_cal>2]<-2
+data$dm_pro<-data$ADVWGTPRG_A
+data$dm_pro[data$dm_pro>2]<-2
+
+data$DM_risk<-data$dm_pa+data$dm_cal+data$dm_pro
+data$DM_risk[data$DM_risk<6]<-1
+data$DM_risk[data$DM_risk==6]<-0
+data$DM_risk<-factor(data$DM_risk, levels= c(0,1), labels=c("No", "Yes"))
+#summary(data$DM_risk)
+#summary(glm(cpain~DM_risk, family=binomial, na.action=na.omit, data))
+
+#sleep
+#how many hours do you sleep at night
+data$sleep<-data$SLPHOURS_A
+data$sleep[data$sleep>24]<-7
+#hist(data$sleep)
+#summary(data$sleep)
+#ggplot(data, aes(x=sleep))+geom_histogram(binwidth = 0.5)
+#eliminating outliers
+data$sleep[data$sleep>12]<-7
+#summary(glm(cpain~sleep, family=binomial, na.action=na.omit, data))
+#summary(m)
+#est=-0.13, intercept=-0.16
+#creating a binary variable for normal (6-8 hours) and abnormal sleep
+data$sleep_abnorm<-ifelse((data$sleep<6|data$sleep>8), 1,0)
+data$sleep_abnorm<-factor(data$sleep_abnorm, levels= c(0,1), labels=c("No", "Yes"))
+#summary(glm(cpain~sleep_abnorm, family=binomial, na.action=na.omit, data))
+#est=0.73, intercept=-1.29
+
+#sleep medication
+#956 missing
+data$sleep_med[data$SLPMED_A==1]<-1
+data$sleep_med[data$SLPMED_A==2]<-2
+data$sleep_med[data$SLPMED_A==3]<-3
+data$sleep_med[data$SLPMED_A==4]<-3
+data$sleep_med[data$SLPMED_A>4]<-1
+data$sleep_med<-factor(data$sleep_med, levels=c(1,2,3), 
+                       labels=c("Never", "Some days", "Most days/every day"))
+#summary(data$sleep_med)
+#comparing the levels' estimates, and unify levels that have similar estimates
+#summary(glm(cpain~sleep_med, family=binomial, na.action=na.omit, data))
+#est=0.51, 1.24
+#summary(glm(opioid~sleep_med, family=binomial, na.action=na.omit, data))
+#est=0.87, 1.67
+#all levels have different estimates
+
+#social support
+#summary(glm(cpain~as.factor(support), family=binomial, na.action=na.omit, data))
+#unify 1+2, missing values recoded as an additional level
+data$support[data$SUPPORT_A==1]<-1
+data$support[data$SUPPORT_A==2]<-1
+data$support[data$SUPPORT_A==3]<-2
+data$support[data$SUPPORT_A==4]<-3
+data$support[data$SUPPORT_A==5]<-4
+data$support[data$SUPPORT_A>5 | is.na(data$SUPPORT_A)]<-5
+data$support<-factor(data$support, levels=c(1,2,3,4,5), 
+                     labels=c("Always/Usually", "Sometimes", "Rarely", "Never", "Missing"))
+
+label(data$cpain)<-"Chronic pain"
+label(data$opioid)<-"Opioid use"
+label(data$age)<-"Age (years)"
+label(data$married)<-"Married"
+label(data$income_grp)<-"Yearly income"
+label(data$veteran)<-"Military service"
+label(data$home_owner)<-"Home owner"
+label(data$uninsured)<-"uninsured"
+label(data$health)<-"Health "
+label(data$hospitalized)<-"Hospitalized in the past 12 months"
+label(data$DM_risk)<-"At risk for Diabetes"
+label(data$dr_12months)<-"Seen a doctor in the past 12 months"
+label(data$mobility1)<-"Walking/climbing stairs"
+
+```
+
+## Outcome variables
+### Chronic pain
+This outcome variable was based on the answer to the question "In the past 3 months, how often did you have pain?". Responses "every day" and "most days" were coded as chronic pain="Yes", and responses "some days" and "never" were coded as "No".   
+There were 17 respondents who refused, 405 not ascertained and 20 who responded "don't know", a total of 442 respondents. Relative to the 7,422 respondents with chronic pain, this is non- negligible number. In order to prevent bias these respondents were omitted from the analysis (442 out of 31,568, 1.4% of the sample). It is common for respondents who answer "refused/not ascertained/don't know" to reply this way more than once, so excluding them could improve data quality.  
+There were no missing values.  
+Our cohort included 7422 respondents with chronic pain (23.8%), and 23,704 respondents with no chronic pain (76.5%), a total of 31,124.  
+
+### Opioid use for chronic pain
+This outcome variable was based on the answer to the question "During the past 3 months, did you take a prescription opioid to treat long-term or chronic pain? yes/no.    
+1,247 respondents reported having used prescription opioids for chronic pain in the past 3 months.  
+Two respondents refused and one respondent chose "Don't know", and they were omitted from the analysis.  
+There were 28,961 missing values, and they were cross-checked with related questions. Most of these respondents did not suffer chronic pain (23,023). Out of those who did have chronic pain, none reported having used prescription opioids in the last 3 months.    
+This missing data quantity is the same as for other opioid-related questions. This might be due to the fact that people tend to skip questions that are irrelevant for them, as illustrated in the following plot.  
+This plot depicts missing values for questions regarding opioid use, by order of appearance in the questionnaire, from left to right: opioid use in the last 12 months, the last 3 months, for acute pain, for chronic pain and frequency of opioid use.  
+We can see that the missing values are consistent across these opioid use variables and fewer and fewer respondents answer the questions as they get more numerous and specific.  
+
+```{r}
+opdf<-data.frame(data[,c("OPD12M_A", "OPD3M_A", "OPDACUTE_A","OPDCHRONIC_A",   "OPDFREQ_A")])
+vis_miss(opdf)+ggtitle("Missing values for opioid use-related questions")
+
+```
+
+We can assume that a missing value means that the respondent did not use opioids for chronic pain in the last 3 months, and the missing values were re-coded accordingly.  
+Our cohort included 1,247 respondents who used prescription opioids for chronic pain in the last 3 months (4%), and 29,877 respondents who did not (96%), a total of 31,124.  
+
+## Predictors
+**Continuous variables** such as age or sleeping hours were plotted to identify and treat outliers and out-of-range values. Responses of "not ascertained/refused/don't know" whose proportion was smaller than 1% were assigned the median value.  
+Based on exploratory analysis, a binary variable was created:    
+**Abnormal amount of sleep**: more than 8 or less than 6 hours per day (yes/no).  
+The variable was tested in logistic regression for chronic pain and opioid use and had a higher odds ratio compared to the continuous variable.
+
+**Categorical variables** represent most of our data, and consist of answers to yes/no or multiple-choice questions. We chose the ones which had a satisfactory response rate, were simple to answer (yes/no), were relevant and comprehensive. Data consistency was verified across related questions where possible.  
+Each question in the survey had optional responses of **Not ascertained/refused/don't know**. These 3 options combined represented not more than 1-2% of responses for each question.   
+For yes/no questions, these respondents were generally added to the "No" group.   
+For multiple-choice questions, these respondents were added to the most frequent (largest) group, or to the medium level group so that they will have the smallest possible influence of outcomes.  
+Logistic regression of the predictor vs. outcome variables was carried out before and after reassignment to verify that this re-coding did not change the estimates.  
+**Missing data** proportion of 2% or less was considered negligible, and the missing data was treated the same as "Not ascertained/refused/don't know". In cases of a larger proportion, missing values were coded as an additional level, or the variable was not used at all.  
+**Re-leveling and unifying categories**- to simplify and focus the models' interpretation levels were unified. Scarce levels were unified to the nearest category.  
+Logistic regression for chronic pain and opioid use were carried out with multi-level predictors. The levels' odds ratios were compared and levels with similar odds ratios were unified. Logistic regression was repeated to ensure that the re-leveled variable is a better predictor than the original variable.  
+**Aggregation**- 3 questions regarding doctor's recommendations for diabetes prevention were aggregated to a variable of diabetes risk (if one of the recommendations was positive, diabetes risk=yes, otherwise=no).  
+**Data validation**- the variable for age over 65+ was not consistent with age, and was corrected according to the respondent's age. 
+
+# Sample description
+Our cohort's socio-demogrphaic and clinical characteristics were compared between those who suffer chronic pain and those who don't. 
+
+```{r}
+
+#sample description
+library(table1)
+table1(~ sex+age+age65+married+income_grp+veteran+home_owner+uninsured+
+         health+hospitalized+DM_risk+ mobility1+mobility2
+       | cpain, data=data, overall="Total", caption="Socio-demographic and clinical characteristics by chronic pain")
+
+```
+
+### Summary
+Our cohort had more female respondents than male (54% vs. 46%). The mean age is 53 years (SD=18.2), and 32% of respondents are 65+ years old. 47% are not married or living with a partner. 10% are veterans, 8% have no medical insurance. 
+
+At a first glance, before we apply weights to adjust for sample imbalances, we can see that people suffering chronic pain tend to be female, older, over 65 years old, earning a lower income and having served in the military. They are more likely to have poorer health, be hospitalized in the past year, be at a risk for diabetes and have difficulty in mobility.
+
+In order to adjust for sample imbalancing in age, race/ethnicity, and sex weights were applied. All analyses were performed on the weighted survey design.
+
+```{r}
+vars<-c("PPSU", "PSTRAT",  "WTFA_A", "cpain", "opioid", 
+        "sex", "age", "age65", "married", "veteran","income_grp", "home_owner",
+        "uninsured", "paybill", "payworry", "foodworry", "caredelay",
+        "counseldelay",
+        "mobility1", "mobility2", "communicating", "cognitive", "work_limited", "social_activity",  "work_lastwk",
+        "health","fatigue", "injury", "dr_12months", "wellness", "urgent_care", "hospitalized",
+       "flu_vaccine", "DM_risk", "sleep_abnorm", "sleep_med",
+       "cig100", "onedrink","drink_heavy", "sport", "sunscreen",  "support",
+      "anx_freq", "anx_med", "anx_level",  "depr_freq", "depr_med", "depr_level", "mhrx")
+
+cdata<-data[,vars]%>%filter(!is.na(data$cpain))
+
+#creating a survey design
+options( survey.lonely.psu = "adjust" )
+nhis <- svydesign(id =~PPSU, strata =~PSTRAT,  nest=TRUE, weights=~WTFA_A, data = cdata)
+
+```
+
+# 1. Prediction model for chronic pain
+A model was developed for predicting chronic pain. Since our outcome variable is a binary variable we used a weighted logistic regression model. 
+
+## Predictors
+In order to identify possible predictors and interactions for the prediction model, the associations between variables and chronic pain and possible interactions were tested using weighted logistic regression models with our survey design.  
+Since we have a large sample, not only p-value but also odds ratios (OR) and their confidence intervals (CIs) were used to assess the variables' significance and predictive ability. (OR ranges between 0 and infinity, OR=1 implies a non-significant predictor. The farther OR is from 1, the stronger the association between the predictor and the outcome).  
+The amount of missing data was also a consideration when choosing a predictor for the model, as we hope to base the model on a maximal proportion of the cohort.  
+This is a preliminary analysis, and the odds ratios are a result of single predictor models. Conclusions regarding the predictors' odds ratios should be drawn from the final multiple regression model, after controlling for all other factors.  
+
+### Socio-demographic characteristics
+
+``` {r}
+#demographics
+model0<-svyglm(cpain~age, family=quasibinomial, design=nhis, na.action = na.omit)
+model1 <- svyglm(cpain ~ sex, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(cpain ~ income_grp, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(cpain ~ age65, design = nhis, family = quasibinomial, na.action = na.omit)
+model2 <- svyglm(cpain ~ married, design = nhis, family = quasibinomial, na.action = na.omit)
+model6 <- svyglm(cpain ~ veteran, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(cpain ~ home_owner, design = nhis, family = quasibinomial, na.action = na.omit)
+tidy0<-tidy(model0, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy1 <- tidy(model1, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy6 <- tidy(model6, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c(31124-length(model0$residuals), 31124-length(model1$residuals),  31124-length(model2$residuals), 31124-length(model3$residuals),
+31124-length(model4$residuals),31124-length(model4$residuals), 31124-length(model4$residuals),
+31124-length(model5$residuals),31124-length(model6$residuals))
+knitr::kable(cbind(bind_rows(tidy0, tidy1, tidy2, tidy3, tidy4, tidy5, tidy6), missing), digits=2,
+             caption="Demographic characteristics: odds ratios for chronic pain", align="l")
+
+```
+
+Among socio-demographic variables, the strongest indicators of chronic pain are being **65+ years old** (OR=2.03, CI: 1.9-2.18), or being a **veteran** (OR=1.89, CI:1.71-2.08).  
+The odd of chronic pain decreases as one's **income** increases. respondents Whose income is 100,000 dollars or greater are 1/0.39=2.54 times less likely to suffer chronic pain compared to respondents whose income is under 35,000 dollars.  
+**Sex** has a statistically significant but relatively low OR (1.17, CI:1.09-1.26), meaning that females have a 17% higher odd of chronic pain compared to males. 
+**Age ** was significantly correlated to chronic pain, with an odds ratio of 1.03 (95% CI: 1.03-1.03). This means that each year of age increases the odd of chronic pain by 3%, or 30% for ten years.  
+**Marital status** and **home ownership** were not statistically significant (p-value=0.77 and 0.35 respectively). 
+
+### Financial concerns 
+
+```{r}
+#financial concerns
+model1 <- svyglm(cpain ~ uninsured, design = nhis, family = quasibinomial, na.action = na.omit)
+model2 <- svyglm(cpain ~ paybill, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(cpain ~ payworry, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(cpain ~ caredelay, design = nhis, family = quasibinomial, na.action = na.omit)
+model6 <- svyglm(cpain ~ foodworry, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(cpain ~ counseldelay, design = nhis, family = quasibinomial, na.action = na.omit)
+tidy1 <- tidy(model1, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy6 <- tidy(model6, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c(31124-length(model1$residuals),  31124-length(model2$residuals), 31124-length(model3$residuals),31124-length(model4$residuals),31124-length(model5$residuals),31124-length(model6$residuals))
+knitr::kable(cbind(bind_rows(tidy1, tidy2, tidy3, tidy4, tidy5, tidy6), missing), digits=2,
+             caption="Financial concerns: odds ratios for chronic pain", align="l")
+
+```
+
+**Having problems paying medical bills** is a strong predictor of chronic pain (OR=2.52, CI:2.29-2.77), as well as **delaying care** (OR=2.46, CI=2.17-2.78) or **counsel** (OR=2.1, CI=1.83-2.42) because of financial difficulty, or **being worried that food will run out** in the last 30 days (OR=2.25, CI=2.03-2.5).   
+Respondents who have **medical insurance** are 1/0.64=1.5 times more likely to suffer chronic pain  (CI=1.35-1.82).
+
+### Disability and participation
+
+```{r}
+model1 <- svyglm(cpain ~ mobility1, design = nhis, family = quasibinomial, na.action = na.omit)
+model2 <- svyglm(cpain ~ mobility2, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(cpain ~ communicating, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(cpain ~ cognitive, design = nhis, family = quasibinomial, na.action = na.omit)
+model6 <- svyglm(cpain ~ work_limited, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(cpain ~ social_activity, design = nhis, family = quasibinomial, na.action = na.omit)
+model7 <- svyglm(cpain ~ work_lastwk, design = nhis, family = quasibinomial, na.action = na.omit)
+tidy1 <- tidy(model1, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy6 <- tidy(model6, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy7 <- tidy(model7, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c(31124-length(model1$residuals),  31124-length(model1$residuals), 
+           31124-length(model2$residuals), 31124-length(model3$residuals),31124-length(model3$residuals),
+           31124-length(model4$residuals), 31124-length(model4$residuals),
+           31124-length(model5$residuals),31124-length(model5$residuals),
+           31124-length(model6$residuals), 31124-length(model6$residuals))
+knitr::kable(cbind(bind_rows(tidy1, tidy2, tidy3, tidy4, tidy5, tidy6, tidy7), missing), digits=2,
+             caption="Disability and social_activity: odds ratios for chronic pain", align="l")
+```
+
+Disability, work participation and social activity participation appear to be strong indicators of chronic pain. Greater difficulty is associated with a higher odd for chronic pain, ranging between 2.5 to 20 times higher compared to respondents who reported no difficulty.    
+Having a lot of difficulty in **mobility (walking/climbing stairs)** has an odds ratio of 19.9 (CI=17.3-22.9), and having some difficulty has an odds ratio of 6.97 (CI=6.63-7.62) for chronic pain.   
+**Using equipment to get around** has an odds ratio of 7.57 (CI=6.75-8.48).  
+Some difficulty or a lot of difficulty in **communication** (OR=2.5 and 3.07) or **cognitive skills** like remembering and concentrating (OR=3.36 and 5.36) or **participating in social activities** (OR=3.98 and 6.22) were also associated with chronic pain.  
+Finally, **being limited in the amount or kind of work you can do** had an odd ratio of 6.05 (CI=5.55-6.6) and **having worked last week** had an odds ratio of 0.42, meaning that people who did not work in the past week were 1/0.42=2.4 times more likely to suffer chronic pain compared to those who did work.
+
+### Health
+
+```{r}
+#health
+model1 <- svyglm(cpain ~ health, design = nhis, family = quasibinomial, na.action = na.omit)
+model2 <- svyglm(cpain ~ fatigue, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(cpain ~ dr_12months, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(cpain ~ wellness, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(cpain ~ urgent_care, design = nhis, family = quasibinomial, na.action = na.omit)
+model6 <- svyglm(cpain ~ hospitalized, design = nhis, family = quasibinomial, na.action = na.omit)
+model7 <- svyglm(cpain ~ opioid, design = nhis, family = quasibinomial, na.action = na.omit)
+model8 <- svyglm(cpain ~DM_risk , design = nhis, family = quasibinomial, na.action = na.omit)
+model9 <- svyglm(cpain ~ sleep_abnorm, design = nhis, family = quasibinomial, na.action = na.omit)
+model10 <- svyglm(cpain ~ sleep_med, design = nhis, family = quasibinomial, na.action = na.omit)
+model11 <- svyglm(cpain ~ flu_vaccine, design = nhis, family = quasibinomial, na.action = na.omit)
+tidy1 <- tidy(model1, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy6 <- tidy(model6, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy7 <- tidy(model7, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy8 <- tidy(model8, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy9 <- tidy(model9, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy10 <- tidy(model10, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy11 <- tidy(model11, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c(31124-length(model1$residuals),31124-length(model1$residuals),31124-length(model1$residuals), 31124-length(model1$residuals), 
+           31124-length(model2$residuals),31124-length(model2$residuals),
+           31124-length(model3$residuals), 31124-length(model4$residuals),
+           31124-length(model5$residuals), 31124-length(model5$residuals),
+           31124-length(model6$residuals), 31124-length(model7$residuals),
+           31124-length(model8$residuals), 31124-length(model9$residuals),
+           31124-length(model10$residuals), 31124-length(model10$residuals),
+           31124-length(model11$residuals))
+knitr::kable(cbind(bind_rows(tidy1, tidy2, tidy3, tidy4, tidy5, tidy6, tidy7, tidy8,tidy9, tidy10, tidy11), missing), digits=2,
+             caption="Health: odds ratios for chronic pain", align="l")
+```
+
+Self-reported **general health** is strongly associated with chronic pain. Poorer health has higher odds ratios of chronic pain, with a marked increase for health statuses "fair" and "poor" (OR=2.03 for "very good", 4.6 for "good", 12.79 for "fair" and 31.12 for "poor").  
+**Using prescription opioids for chronic pain** and chronic pain are strongly associated (OR=22.84, CI:18.5-28).   
+Higher levels of **fatigue** are associated with an increased odds ratio of chronic pain (OR=2.35, 7.44 and 12.11).   
+People who utilized health services such as **visiting the doctor**, **being hospitalized**, receiving **urgent care** 4+ times in the past 12 months or **getting a flu vaccine** have higher odds of chronic pain (OR=2.27, 2.57, 2.5 and 1.4).   
+People at **risk for diabetes**, or have **abnormal amount of sleep** or use **sleep medication** frequently are also at a higher odds for chronic pain (OR=2.2, 2.12, 3.82).
+  
+
+### Life style
+
+```{r}
+#life style
+#  flu_vaccine+cig100+PA+sunscreen+
+
+model2 <- svyglm(cpain ~ cig100, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(cpain ~ onedrink, design = nhis, family = quasibinomial, na.action = na.omit)
+model6<-svyglm(cpain ~ drink_heavy, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(cpain ~ sport, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(cpain ~ sunscreen, design = nhis, family = quasibinomial, na.action = na.omit)
+
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy6 <- tidy(model6, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c( 31124-length(model2$residuals), 31124-length(model6$residuals), 
+           31124-length(model3$residuals), 
+           31124-length(model4$residuals),31124-length(model4$residuals), 
+           31124-length(model5$residuals), 31124-length(model5$residuals) )
+knitr::kable(cbind(bind_rows(tidy2, tidy6, tidy3, tidy4, tidy5), missing), digits=2,
+             caption="life style: odds ratios for chronic pain", align="l")
+```
+
+Life style characteristics demonstrated weaker associations with chronic pain.  
+**Smoking** at least 100 cigarettes during a lifetime had an odds ratio of 2.29 (CI=2.14-2.46).   
+**Drinking at least one alcoholic drink during a lifetime** had an odds ratio of 0.87 (CI=0.80-0.94).  
+**Heavy drinking** (having an occasion of binge drinking in the past year: 4+ drinks for women and 5+ drinks for men) had an odds ratio of 1.5 (CI=1.33, 1.7).  
+**Physical activity** had an odds ratio of 0.49 (CI=0.45, 0.52) for people who reported being sufficiently active. The odds ratio for insufficiently active was not statistically significant.     
+**Using sunscreen** sometimes compared to always/most times was not statistically significant (p-value=0.24), while using sunscreen rarely or never had an odds ratio of 1.4 (CI=1.28-1.54). There were 410 missing values for this variable.
+
+### Mental health
+
+```{r}
+#mental health
+model2 <- svyglm(cpain ~ anx_freq, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(cpain ~ anx_level, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(cpain ~ anx_med, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(cpain ~ depr_freq, design = nhis, family = quasibinomial, na.action = na.omit)
+model6 <- svyglm(cpain ~ depr_level, design = nhis, family = quasibinomial, na.action = na.omit)
+model7 <- svyglm(cpain ~ depr_med, design = nhis, family = quasibinomial, na.action = na.omit)
+model8 <- svyglm(cpain ~mhrx , design = nhis, family = quasibinomial, na.action = na.omit)
+
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy6 <- tidy(model6, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy7 <- tidy(model7, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy8 <- tidy(model8, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c(31124-length(model2$residuals), 
+           31124-length(model3$residuals), 31124-length(model3$residuals), 
+           31124-length(model4$residuals), 
+           31124-length(model5$residuals), 
+           31124-length(model6$residuals), 31124-length(model6$residuals),
+           31124-length(model7$residuals), 31124-length(model8$residuals))
+knitr::kable(cbind(bind_rows(tidy2, tidy3, tidy4, tidy5, tidy6, tidy7, tidy8), missing), digits=2,
+             caption="Mental health: odds ratios for chronic pain", align="l")
+```
+
+Anxiety and depression are associated with chronic pain.   
+respondents who reported **daily/weekly feelings of anxiety or depression** had an OR of 2.45 (CI=2.27-2.64) and 3.67 (CI=3.3-4.07) of suffering chronic pain, respectively, compared to respondents who reported less frequent feelings.   
+**High levels of anxiety and depression** had a higher odds ratio of OR=4.11 (CI=3.59-4.7) and 2.66 (CI=2.44-2.9) compared to respondents who reported never experiencing anxiety of depression.  
+**Taking medication for anxiety or depression** also had a higher odds ratio (OR=2.72 and 3.24), with a smaller odds ratio for **taking other prescription mental health medication** (OR=1.54, CI=1.21-1.95).
+
+### Interactions
+Weighted logistic regressions for chronic pain with interactions between variables were applied to identify possible interactions for the model. Interactions that were statistically significant, had large odds ratios and were clinically relevant were selected for our model building.  
+The interaction that had the largest odds ratio was an interaction between **age of 65+ years and mobility** (walking/climbing stairs).  
+A weighted logistic regression model with this interaction as a predictor of chronic pain was tested and a post-hoc analysis was carried out. (The odds ratios are presented as an illustration, not as a part of the complete prediction model). In the plot we can see that difficulty in mobility is associated with an increased odd for chronic pain, and the increase is bigger for people under 65 years old.
+
+```{r}
+library(emmeans)
+m3<-svyglm(cpain~age65*mobility1, family=quasibinomial, design=nhis, na.action = na.omit)
+emmip(m3,  age65~mobility1, CIs=TRUE, plotit=T)+theme_bw()+ggtitle("Interaction of age 65+ and mobility")
+```
+
+People under 65 (pink) who have no difficulty in mobility are less likely to suffer chronic pain compared to older individuals.     
+However, people under 65 who have some/a lot of difficulty in mobility are more likely to suffer chronic pain compared to people over 65 (blue) with the same level of difficulty.  
+Looking at the post-hoc analysis of the interaction, we can see this finding in detail:
+
+```{r}
+a<-c("age65", "mobility1",  "OR", "CI lower bound",  "CI upper bound") 
+b<-c("under 65", "No difficulty", "0.15",  "0.14", "0.16") 
+c<-c("65+", "No difficulty", round(exp(-1.563), digits=2),  round(exp(-1.654), digits=2), round(exp(-1.4719), digits=2))
+d<-c("under 65", "Some difficulty",  round(exp(0.326), digits=2),round(exp(0.200), digits=2),  round(exp(0.4518), digits=2))
+e<-c("65+", "Some difficulty",  round(exp(-0.133), digits=2), round(exp(-0.242), digits=2), round(exp(-0.0244), digits=2))
+f<-c("under 65", "A lot of difficulty/unable",  round(exp(1.628), digits=2),  round(exp(1.326), digits=2),round(exp(1.9298), digits=2))
+g<-c("65+", "A lot of difficulty/unable",  round(exp(0.864), digits=2),  round(exp(0.683), digits=2), round(exp(1.0446), digits=2))
+knitr::kable(t(cbind(a,b,c,d,e,f,g)), 
+             caption="Interaction post-hoc analysis: age 65+ and mobility", digits=2, align="l")
+
+```
+
+
+For people with **no difficulty** in mobility, people who are 65+ years old are more likely to suffer chronic pain compared to younger individuals (OR=0.21 vs. 0.15).  
+However, we see the opposite trend for people who have some or a lot of difficulty in mobility:  
+**Some difficulty** in mobility: people who are under 65 years old have a higher odds ratio of suffering chronic pain compared to people who are 65+ years old and share the same level of disability (OR of 1.39 vs. 0.88).    
+**A lot of difficulty** in mobility: the trend is similar and stronger. people under 65 years old have an odds ratio of 5.09 while older individuals have an odds ratio of 2.37.
+
+### Summary
+Our predictors show significant associations with chronic pain. Missing data proportions are negligible. Multi-level predictors demonstrate a noticeable difference in odds ratios between levels, which validates our data preparation process. The strongest predictors are related to disability and health, while demographic and life style factors appear to be secondary. there is an interaction between age of 65+ years and mobility. People under 65 who have difficulty in mobility are more likely to suffer chronic pain compared to older individuals.  
+
+
+## Model fitting
+For our prediction models we used weighted logistic regression, with the above-mentioned predictors and interactions. Models' assumptions were met.  
+
+### Model evaluation methods
+Our outcome variable has unbalanced classes: 24% of our cohort suffer chronic pain (7,420 respondents) and 76% do not (23,704 respondents).   
+To compare our models and choose the best fit we used **weighted ROC curves** (Receiver operator characteristics Curve), which is a graphical summary showing the proportion of true positives and false positives at all possible values of probability cutoff, while considering the data weights.   
+Our model comparison metric was the **AUC**-Area Under the ROC Curve, which is well-suited for the comparison and evaluation of classifiers of unbalanced data. Its values range between 0.5 and 1.00. AUC>0.8 is an indication of a good classifier. 
+
+Our models' predictive ability was tested using train and test sets.   
+In order to verify that our test set has enough cases of chronic pain to adequately assess the models' performance and that our train set has enough patterns on which to build the models, we used **stratified train and test sets**. We split our cohort randomly to a train set and a test set, while making sure each set has the same proportion of respondents with chronic pain (24%).
+
+Several models with combinations of predictors and different interactions were tested using the stratified train and test sets and their AUC was compared.  
+
+```{r}
+set.seed(123)
+#creating train and test set stratified by opioid use
+yesdata<-cdata%>% filter(cpain=="Yes")#df of opioid users
+nodata<-cdata%>% filter(cpain=="No")# df of non-users
+
+yestraining.samples <- yesdata$cpain %>% createDataPartition(p = 0.8, list = FALSE)
+yestrain.data  <- na.omit(yesdata[yestraining.samples, ])
+yestest.data <- na.omit(yesdata[-yestraining.samples, ])
+
+notraining.samples <- nodata$cpain %>% createDataPartition(p = 0.8, list = FALSE)
+notrain.data  <- na.omit(nodata[notraining.samples, ])
+notest.data <- na.omit(nodata[-notraining.samples, ])
+
+train.data<-bind_rows(yestrain.data, notrain.data)
+test.data<-bind_rows(yestest.data, notest.data)
+
+train.design<-svydesign(id =~PPSU, strata =~PSTRAT,  nest=TRUE, weights=~WTFA_A, data = train.data)
+knitr::kable(cbind(summary(train.data$cpain),summary(test.data$cpain)), 
+             col.names = c("Train set", "Test set"), caption=("Test and train sets by chronic pain"), align="l")
+```
+
+### Models
+We will present the 2 best models:
+**Model 1** was fitted with all the above-mentioned predictors, and achieved an AUC of 0.843.
+
+```{r}
+#model 1: all predictors
+m1<-(svyglm(cpain~ opioid+sex+age+age65+married+veteran+income_grp+home_owner+uninsured+
+              paybill+payworry+caredelay+foodworry+counseldelay+
+              mobility1+mobility2+communicating+cognitive+work_limited+social_activity+
+              work_lastwk+
+              health+fatigue+injury+dr_12months+wellness+urgent_care+hospitalized+
+              flu_vaccine+support+
+              cig100+onedrink+drink_heavy+sport+sunscreen+DM_risk+sleep_abnorm+sleep_med+
+               anx_freq+anx_med+anx_level+depr_freq+depr_med+depr_level+mhrx,
+            family=quasibinomial, design=train.design, na.action = na.omit))
+#AUC=0.8436
+
+#deriving predictions for the test set
+guess<-predict(m1, newdata=test.data, type="response")
+tp.fp<-WeightedROC(guess, test.data$cpain, test.data$WTFA_A)
+auc<-WeightedAUC(tp.fp)#0.845
+
+#plotting the roc curve
+ggplot()+ geom_path(aes(FPR, TPR), data=tp.fp)+ xlab("1-Specificity")+
+  ylab("Sensitivity")+coord_equal() +ggtitle("Model 1: ROC curve")+
+  annotate(geom="text", x=0.5, y=0.5, label="AUC=0.843",
+              color="black")
+
+```
+
+**Model 2** included interactions between age 65+ and mobility (walking/climbing stairs) and all predictors except for a few redundant predictors. (a model with all predictors and this interaction had a slightly lower AUC). This model's AUC was 0.846, a little  better than model 1. 
+
+```{r}
+
+
+#model 2: subset of predictors with interactions
+m2<-(svyglm(cpain~age65*mobility1+ sex+age+home_owner+
+              veteran+income_grp+uninsured+married+
+              paybill+payworry+foodworry+caredelay+counseldelay+
+            mobility2+communicating+cognitive+work_limited+social_activity+work_lastwk+
+              opioid+health+fatigue+injury+dr_12months+wellness+hospitalized+urgent_care+
+             flu_vaccine+cig100+drink_heavy+onedrink+DM_risk+sleep_med+sleep_abnorm+
+            anx_freq+anx_med+depr_freq+depr_med,
+            family=quasibinomial, design=train.design, na.action = na.omit))
+#deriving predictions for the test set
+guess1<-predict(m2, newdata=test.data, type="response")
+tp.fp1<-WeightedROC(guess1, test.data$cpain, test.data$WTFA_A)
+auc1<-WeightedAUC(tp.fp1)#0.846
+
+#plotting the roc curve
+ggplot()+ geom_path(aes(FPR, TPR), data=tp.fp1)+ xlab("1-Specificity")+
+  ylab("Sensitivity")+coord_equal() +ggtitle("Model 2: ROC curve")+
+  annotate(geom="text", x=0.5, y=0.5, label="AUC=0.846",
+              color="black")
+
+
+
+```
+
+
+```{r}
+
+#thresh<-tp.fp1$threshold[which.min(tp.fp1$FP+tp.fp1$FN)]
+#threshold by maximal sensitivity and specificity
+#thresh1<-tp.fp1$threshold[which.max(tp.fp1$TPR +(1-tp.fp1$FPR))]
+#thresholds for sensitivity of 0.85, 0.9 and 0.95
+#t85<-tp.fp1$threshold[0.848<tp.fp1$TPR & 0.852>tp.fp1$TPR] #0.127
+#t90<-tp.fp1$threshold[0.898<tp.fp1$TPR & 0.902>tp.fp1$TPR] #0.102
+#t95<-tp.fp1$threshold[0.948<tp.fp1$TPR & 0.952>tp.fp1$TPR] #0.0783
+
+#calculating model accuracy:
+#library(MLmetrics)
+
+#results<-data.frame(guess1)
+#predicted.classes1 <- ifelse(results$response > 0.2, "Yes", "No")
+#conf<-confusionMatrix(as.factor(predicted.classes1), test.data$cpain, positive="Yes")
+#F1_Score(test.data$cpain, predicted.classes1, positive="Yes")
+```
+
+## Model performance
+We can proceed to evaluate the second model's prediction ability.   
+The ROC curve allows us to find the **optimal threshold**, the cut-off probability which maximizes sensitivity and specificity.  
+**Sensitivity** is a measure of the classifier's ability to correctly identify true cases, such as chronic pain users (as few false negatives as possible).  
+**Specificity** is a measure of the classifier's ability to correctly identify non-cases (as few false positives as possible).  
+**Balanced accuracy** is the average of sensitivity and specificity. It is another appropriate measure for evaluation of unbalanced data classifiers.  
+The **threshold** can be set to balance between sensitivity and specificity. In our case, the hreshold optimizing both sensitivity and specificity is 0.2.
+
+The model's **specificity** is **77%** and **sensitivity** is **75%**.   
+The model's **balanced accuracy** is **76%**.
+
+**F1 score**- is another measure of accuracy, balancing the model’s sensitivity and precision. this score takes both false positives and false negatives into account, and it's more useful than accuracy for evaluating performance for unbalanced classes. It ranges from 0 (lowest performance) to 1 (perfect prediction).   
+Our model's **F1 score is 0.608**.
+
+A lower threshold can be selected, if we would like higher sensitivity (lower false negative rate) at the expense of lower specificity (higher false positive rate), and vice versa. Since our goal is to predict chronic pain, sensitivity should be prioritized. In the table below we can see examples of sensitivity rates with their respective specificity rates, F1 score, balance accuracy and threshold.
+
+```{r}
+Sensitivity<-c(0.85, 0.90, 0.95)
+Specificity<-c(0.60, 0.50, 0.37)
+F1_score<-c(0.61, 0.52, 0.48)
+Balanced_accuracy<-c(0.73, 0.66, 0.66)
+Threshold<-c(0.129, 0.102, 0.08)
+df<-cbind(Sensitivity, Specificity, F1_score, Balanced_accuracy, Threshold)
+knitr::kable(df,caption="Model's sensitivity and specificity by threshold", align="l")
+
+```
+
+The model succeeded in predicting chronic pain for the test data, which means it is not over-fitted, and its diagnostic parameters are fair. The first model (containing all predictors and no interactions) was also tested in the same way and achieved very similar and slightly lower performance statistics.
+
+
+## Model interpretation
+We'll interpret the model's predictors' odds ratios. We can see that in this multiple regression model our variables have different and smaller odds ratios than the ones we found in the single variable models. 
+
+```{r}
+export_summs(m2, error_format = "[{conf.low}, {conf.high}]", error_pos=c("right"),  model.names= c("Odds ratios [95% confidence interval]"), confint = TRUE, digits = 2, exp=TRUE, pvals = FALSE)
+```
+
+We'll start with interpreting the interaction between age of 65+ years and mobility.  
+
+### Interaction between age of 65+ years old and mobility (walking/climbing stairs)    
+The interaction was statistically significant for both levels (some difficulty and a lot of difficulty). Post-hoc analysis of the interaction was carried out and the interaction was plotted. 
+
+```{r}
+library(effects)
+result <- allEffects(m2)
+plot(result$`age65:mobility1`)
+```
+
+In the plots above and in the odds ratios table below we can see that people under 65 years old have a higher odd of chronic pain compared to older individuals with the same level of disability. For people under 65, there is a far bigger difference in odds for chronic pain between "no difficulty" and "some difficulty", compared to people who are 65+ years old. 
+we can conclude that chronic pain is associated with difficulty in mobility, and more so for people under 65 years old.   
+
+```{r}
+
+#summary(result$`age65:mobility1`)
+
+OR<-round(exp(result$`age65:mobility1`$fit), digits=2)
+CI_upper<-round(exp(result$`age65:mobility1`$upper), digits=2)
+CI_lower<-round(exp(result$`age65:mobility1`$lower), digits=2)
+Age<-c("Under 65", "65+","Under 65", "65+","Under 65", "65+")
+Mobility<-c("No difficulty", "No difficulty", "Some difficulty", "Some difficulty", "A lot of difficulty", "A lot of difficulty")
+knitr::kable(cbind(Age, Mobility, OR, CI_lower, CI_upper), 
+             col.names=c("Age", "Mobility", "OR", "CI lower bound", "CI upper bound"),
+             caption="Interaction post-hoc analysis: age 65+ and mobility", align="l")
+
+
+```
+
+
+Older people may suffer difficulty in mobility due to age-related rather than pain-related causes, such as balance deficits, loss of muscle mass, frailty, neurological disorders and other illnesses that are age-related. This may contribute to the fact that difficulty in mobility is more strongly associated to chronic pain in younger individuals.  
+
+### Predictors
+We will interpret all statistically significant variables that were not a part of an interaction:  
+
+### Socio-demographic characteristics
+**Age** had an odds ratio of 1.02 (CI=1.01, 1.02), meaning the each year of age is associated with a 2% increased odd for chronic pain, or, for example, a 20% increased odd for each 10 years of age.  
+**Marital status** had an odds ratio of 1.20 (CI=1.08, 1.35), meaning that people who have a spouse have a 20% increased odd of chronic pain, compared to people who are single. This factor was not statistically significant in a single variable regression model, but it was statistically significant in the multiple regression model.      
+**Military service** had an odds ratio of 1.31 (CI=1.13, 1.55) meaning that veterans had a 31% increased odd for chronic pain compared to others.  
+Factors sex, income and home ownership status were not statistically significant.  
+
+### Financial concerns
+**Delaying care because of financial difficulty** had an odds ratio of 1.43 (CI=1.15, 1.79), meaning that people who reported delaying care had a 43% increased odd of chronic pain compared to those who did not.  
+**Being worried food will run out** in the past 30 days had an odds ratio of 1.23 (CI=1.04, 1.45), meaning that people who had food security concerns had a 23% increased odd for chronic pain compared to people who did not.  
+Having no medical coverage, having trouble or being worried about paying medical bills, and also delaying counsel because of financial difficulty were not statistically significant.   
+
+### Disability and participation
+We already know that difficulty in mobility is strongly associated with chronic pain.  
+**Cognitive ability**- having some difficulty in remembering or concentrating had an odds ratio of 1.18 (CI=1.03, 1.36), meaning that people who reported some difficulty had a 18% increase odd for chronic pain compared to people who reported no difficulty.  
+A lot of difficulty had an odds ratio of 0.76, but it was not statistically significant (CI=0.53, 1.08). This might be due to the relatively low number of respondents in this category (374 with chronic pain and 289 without, total=663).  
+**Participation in social activity**- had an odds ratio of 1/0.74=1.35 (CI=1.05,1.78), meaning that people who reported no difficulty in participating in social activity were 1.37 times more likely to suffer chronic pain compared to those who reported having a lot of difficulty/unable to participate in social activity.    
+**Being limited in the amount or type of work you can do** had an odds ratio of 1.64 (CI=1.45, 1.86), meaning that people who are limited in their ability to work have a 64% increased odd for chronic pain relative to those who are not limited.  
+Using equipment to get around and having difficulty in communication were not a statistically significant predictor for chronic pain, as well as having worked last week.
+
+### Health
+**Opioid usage** had an odds ratio of 7 (CI=5.38, 9.11), meaning that people who use prescription opioids for chronic pain a 7 times more likely to suffer chronic pain.  
+**General health**- all levels of health were statistically significant in predicting chronic pain, and the odds ratios increased for poorer reported health status, though the increase was far milder in the multiple regression model and there was a small decrease for level "Poor".   
+Compared to health status "Excellent" (1/5):  
+**"Very good"** (2/5) had a 34% increased odd for chronic pain (OR=1.34, CI=1.14, 1.58).   
+**"Good"** (3/5) had a 89% increased odd for chronic pain (OR=1.89, CI=1.58, 2.24).   
+**"Fair"** (4/5) were 2.4 times more likely to suffer chronic pain (OR=2.4, CI=1.95, 2.95).   
+**"Poor"** (5/5) were 2.14 times more likely to suffer chronic pain (OR=2.14, CI=1.60, 2.87).  
+**Fatigue**- feeling fatigued most days/every day had an odds ratio of 3.84 (CI=3.25, 4.53) of suffering chronic pain. This means that they are 3.84 time more likely to suffer chronic pain compared to those reported not feeling fatigued.  
+Feeling fatigued some days had an odds ratio of 1.58 (CI=1.39, 1.79), meaning a 60% increased odd for chronic pain compared to those not feeling fatigued.  
+**Injury** or accident in the past 3 months had an odds ratio of 1.79 (CI=1.53, 2.09). People who were injured are at a 80% increased odd of chronic pain.  
+**Using sleep medication** most days/every day had an odds ratio of 1.57 (CI=1.35, 1.83). People who use sleep medication regularly have a 57% increased odd for chronic pain relative to those who don't use sleep medication at all.  
+Using sleep medication some days had an odds ratio of 1.24 (CI=1.05, 1.45), and those using sleep medication occasionally had a 24% increased odd for chronic pain compared to those who don't use sleep medication at all.  
+**Wellness doctor's visit** had an odds ratio of 1/0.79=1.27 (CI=1.14, 1.45), meaning that people whose last doctor's visit was not a wellness visit had a 27% increased odd of chronic pain, compared to people whose last visit was a wellness visit.  
+Utilizing the health services of a doctor's visit, being hospitalized, receiving urgent care or getting a flu vaccine in the past 12 months were not statistically significant predictors of chronic pain. Having an abnormal amount of sleep or having a doctor's recommendation for diabetes prevention were also not statistically significant predictors.  
+
+### Life style
+**Smoking** at least 100 cigarettes in a lifetime had an odds ratio of 1.33 (CI=1.21, 1.46), meaning that people who reported smoking had a 33% increased odd for chronic pain compared to those who did not.  
+**Having at least one drink in a lifetime** had an odds ratio of 1.35 (CI=1.11, 1.64), meaning that people who had at least one alcoholic drink have a 35% increased odd for chronic pain compared to abstainers.  
+Other life style factors: binge drinking, sports activity level and using sunscreen were not statistically significant predictors for chronic pain.  
+
+### Mental health
+**Anxiety**- daily/weekly feelings of anxiety had an odds ratio of 1.43 (CI=1.25, 1.63), meaning that people who experience frequent feelings of anxiety had a 44% increase odd of chronic pain, compared to people who experience anxiety less often.   
+frequency of feelings of depression, the level of anxiety or depression and taking medication for anxiety or depression were not statistically significant.  
+
+
+## Conclusions
+Our prediction model was a weighted logistic regression model that was evaluated using a train and test sets and a ROC curve. It achieved an AUC of 0.846 and managed to predict the test set with a **sensitivity of 75% and specificity of 77%**. Other thresholds can be chosen to prioritize sensitivity or specificity, to one's discretion.  
+The most prominent predictors were health-related, whereas socio-demogrpahic and life style factors were mostly non-significant once controlling for all other factors.
+
+**Health**-related predictors of chronic pain included opioid usage (OR=7), low self-reported general health status (OR=1.34-2.4), frequent feelings of fatigue (OR=3.92, 1.6) or anxiety (OR=1.44), using sleep medication (OR=1.24, 1.57), suffering an injury or accident (OR=1.8) and anxiety (OR=1.43).  
+**Disability**-related predictors included difficulties in memory/concentration (OR=1.18) or in participating in social activity (OR=0.74) and being limited in the amount or type of work you can do (OR=1.64).   
+There Was an interaction between being 65+years old and difficulty in mobility (walking/climbing stairs). People under 65 who have difficulty in mobility are more likely to suffer chronic pain compared to people over 65 with the same level of difficulty.  
+**Financial concerns** were also statistically associated with chronic pain. Delaying care because of financial difficulty (OR=1.44) and being worried about food security (OR=1.23) had increased odds for suffering chronic pain. An increased odd of chronic pain was also demonstrated for people with medical coverage (OR=1.22) compared to those who are not covered, and for people whose last visit to the doctor was not a wellness visit (OR=1.28).  
+**Life style** factors that were statistically significant were smoking at least 100 cigarettes in a lifetime (OR=1.33), drinking at least one drink in a lifetime (OR=1.35).  
+An increased odd for chronic pain was present for **demographic factors** such as being married/living with a partner (OR=1.21), being a veteran (OR=1.31) and to a lesser extent- being older (OR=1.02). Sex and income level were not statistically significant.  
+
+
+# 2. Prediction model for opioid use
+
+A model was built for prediction of using prescription opioids for treatment of chronic pain.
+First, we'll take a look at the un-weighted data and compare demographic and clinical characteristics of the opioid use and no opioid use groups.  
+
+```{r}
+table1(~ cpain+sex+age+age65+married+income_grp+veteran+home_owner+uninsured+
+         health+hospitalized+DM_risk+ mobility1+mobility2
+       | opioid, data=data, overall="Total", caption="Socio-demographic and clinical characteristics by opioid use")
+
+```
+
+The opioid use group shows similar trends to those seen in chronic pain vs. no pain: opioid users are more likely to be female, older, over 65 years old, earning a lower income, having served in the military. They are more likely to have poorer health, be hospitalized in the past year, be at a risk for diabetes and have difficulty in mobility.    
+The differences between the opioid and non-opioid groups are more pronounced compared to chronic pain vs. no pain, especially for health-related variables and disability.  
+
+We will proceed to identifying predictors for opioid usage. All analyses were carried out on the same weighted survey design.  
+
+## Predictors
+We will test the associations of opioid use with our predictors, using weighted logistic regression on our survey design. The associations are assessed by odds ratios (OR) and their confidence intervals (CIs). The prevalence of opioid users in our cohort is only 4%, so missing data is an important factor in considering a predictor.  
+In this case as well, conclusions cannot be drawn from these odds ratios before we enter these predictors to a multiple regression model and control for all other factors.  
+
+### Socio-demographic characteristics
+
+``` {r}
+#demographics
+model0 <- svyglm(opioid ~ sex, design = nhis, family = quasibinomial, na.action = na.omit)
+model1 <- svyglm(opioid ~ sex, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(opioid ~ income_grp, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(opioid~ age65, design = nhis, family = quasibinomial, na.action = na.omit)
+model2 <- svyglm(opioid ~ married, design = nhis, family = quasibinomial, na.action = na.omit)
+model6 <- svyglm(opioid ~ veteran, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(opioid ~ home_owner, design = nhis, family = quasibinomial, na.action = na.omit)
+tidy0 <- tidy(model0, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy1 <- tidy(model1, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy6 <- tidy(model6, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c(31124-length(model0$residuals),31124-length(model1$residuals),  31124-length(model2$residuals), 31124-length(model3$residuals),31124-length(model4$residuals),31124-length(model5$residuals),31124-length(model6$residuals))
+knitr::kable(cbind(bind_rows(tidy1, tidy2, tidy3, tidy4, tidy5, tidy6), ""), digits=2,
+             caption="Socio-demographic characteristics: odds ratios for opioid use", align="l")
+
+```
+
+The strongest indicator of opioid use is the level of **income**: earning 100,000 dollars per year or more means you are 1/0.29=3.5 times less likely to use opioids, relative to people who earn less than 35,000 dollars per year.  
+Other indicators are **being over 65 years old** (OR=2.24, CI: 1.94-2.59), or being a **veteran** (OR=1.61, CI:1.71-2.08). The odd of opioid use decreases for **married** people by 13% relative to people who are not, and is 41% higher for **females** compared to males. 
+**Home owners** have a 4% higher odd for opioid use.   
+**Age ** is significantly correlated to opioid use, with an odds ratio of 1.04 (CI: 1.03-1.04). This means that each year of age increases the odd of chronic pain by 4%, or 40% for ten years.  
+
+
+### Financial concerns
+
+```{r}
+#financial concerns
+model1 <- svyglm(opioid ~ uninsured, design = nhis, family = quasibinomial, na.action = na.omit)
+model2 <- svyglm(opioid ~ paybill, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(opioid ~ payworry, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(opioid ~ caredelay, design = nhis, family = quasibinomial, na.action = na.omit)
+model6 <- svyglm(opioid ~ foodworry, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(opioid ~ counseldelay, design = nhis, family = quasibinomial, na.action = na.omit)
+tidy1 <- tidy(model1, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy6 <- tidy(model6, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c(31124-length(model1$residuals),  31124-length(model2$residuals), 31124-length(model3$residuals),31124-length(model4$residuals),31124-length(model5$residuals),31124-length(model6$residuals))
+knitr::kable(cbind(bind_rows(tidy1, tidy2, tidy3, tidy4, tidy5, tidy6), missing), digits=2,
+             caption="Financial concerns odds ratios for opioid use", align="l")
+
+```
+
+**Having problems paying medical bills** is a strong predictor of opioid use (OR=2.87, CI:2.41-3.42), as well as **being worried that food will run out** (OR=2.44), **being worried about paying medical bills** (oR=1.6) and **delaying care or counsel because of financial difficulty** (OR=1.67, 1.59). Respondents who have **medical insurance** are 1/0.25= 4 times more likely to use prescription opioids.
+
+### Disability and participation
+
+```{r}
+model1 <- svyglm(opioid ~ mobility1, design = nhis, family = quasibinomial, na.action = na.omit)
+model2 <- svyglm(opioid ~ mobility2, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(opioid ~ communicating, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(opioid ~ cognitive, design = nhis, family = quasibinomial, na.action = na.omit)
+model6 <- svyglm(opioid ~ work_limited, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(opioid ~ social_activity, design = nhis, family = quasibinomial, na.action = na.omit)
+model7 <- svyglm(opioid ~ work_lastwk, design = nhis, family = quasibinomial, na.action = na.omit)
+tidy1 <- tidy(model1, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy6 <- tidy(model6, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy7 <- tidy(model7, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c(31124-length(model1$residuals),  31124-length(model1$residuals), 
+           31124-length(model2$residuals), 31124-length(model3$residuals),31124-length(model3$residuals),
+           31124-length(model4$residuals), 31124-length(model4$residuals),
+           31124-length(model5$residuals),31124-length(model5$residuals),
+           31124-length(model6$residuals), 31124-length(model6$residuals))
+knitr::kable(cbind(bind_rows(tidy1, tidy2, tidy3, tidy4, tidy5, tidy6, tidy7), missing), digits=2,
+             caption="Disability and social_activity: odds ratios for opioid use", align="l")
+```
+
+Disability, social activity and work participation appear to be strong indicators of opioid use. Greater difficulty is associated with a higher odd for opioid use.  
+The following variables are all associated with a higher odd for opioid use, ranging between 2.5 to 20 times higher compared to respondents who are not disabled:
+Having difficulty in **mobility** (walking/climbing stairs) (OR=20.24 and 7.42), **using equipment to get around** (OR=8.74), **being limited in the amount of kind of work you can do** (OR=8.82), participating in **social activity** (OR=5.9 and 5.36), or having difficulty in **communication** (OR=2.48 and 2.69) or **cognition** (OR=4.12 and 3.21). 
+
+### Health
+
+```{r}
+#health
+model1 <- svyglm(opioid ~ health, design = nhis, family = quasibinomial, na.action = na.omit)
+model2 <- svyglm(opioid ~ fatigue, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(opioid ~ dr_12months, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(opioid ~ wellness, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(opioid ~ urgent_care, design = nhis, family = quasibinomial, na.action = na.omit)
+model6 <- svyglm(opioid ~ hospitalized, design = nhis, family = quasibinomial, na.action = na.omit)
+model7 <- svyglm(opioid ~ cpain, design = nhis, family = quasibinomial, na.action = na.omit)
+model8 <- svyglm(opioid ~DM_risk , design = nhis, family = quasibinomial, na.action = na.omit)
+model9 <- svyglm(opioid ~ sleep_abnorm, design = nhis, family = quasibinomial, na.action = na.omit)
+model10 <- svyglm(opioid ~ sleep_med, design = nhis, family = quasibinomial, na.action = na.omit)
+model11 <- svyglm(opioid ~ flu_vaccine, design = nhis, family = quasibinomial, na.action = na.omit)
+tidy1 <- tidy(model1, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy6 <- tidy(model6, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy7 <- tidy(model7, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy8 <- tidy(model8, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy9 <- tidy(model9, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy10 <- tidy(model10, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy11 <- tidy(model11, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c(31124-length(model1$residuals),31124-length(model1$residuals),31124-length(model1$residuals), 31124-length(model1$residuals), 
+           31124-length(model2$residuals),31124-length(model2$residuals),
+           31124-length(model3$residuals), 31124-length(model4$residuals),
+           31124-length(model5$residuals), 31124-length(model5$residuals),
+           31124-length(model6$residuals), 31124-length(model7$residuals),
+           31124-length(model8$residuals), 31124-length(model9$residuals),
+           31124-length(model10$residuals), 31124-length(model10$residuals),
+           31124-length(model11$residuals))
+knitr::kable(cbind(bind_rows(tidy1, tidy2, tidy3, tidy4, tidy5, tidy6, tidy7, tidy8,tidy9, tidy10, tidy11), ""), digits=2,
+             caption="Health: odds ratios for opioid use", align="l")
+```
+
+Self-reported **general health** is strongly associated with opioid use. Poor health has an odds ratio of 50.44 (CI=33.8-75.3), this means that respondents who described their general health as "Poor" were 50 times more likely to use prescription opioids. The trend is consistent, and better health has lower odds ratios for opioid use.  
+We already know that opioid use and **chronic pain** are strongly associated, and the odds ratio opioid use for people suffering chronic pain is 22.84 (CI=18.5-28.2).    
+Higher levels of **fatigue** are associated with an increased odds ratio of opioid use (OR=2.46, 6.07 and 8.91).   
+People who utilized health services such as **visiting the doctor**, being **hospitalized** or receiving **urgent care** 4+ times in the past 12 months or **getting a flu vaccine**  have higher odds of opioid use (OR=10.5, 3.48, 2.85, 1.95).  
+People at **risk for diabetes**,  or have **abnormal amount of sleep** or use **sleep medication** frequently are also at higher odds for opioid use (OR=2.29, 2.34, 5.6).
+
+### Life style
+
+```{r}
+#life style
+model1 <- svyglm(opioid ~ drink_heavy, design = nhis, family = quasibinomial, na.action = na.omit)
+model2 <- svyglm(opioid ~ cig100, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(opioid ~ onedrink, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(opioid ~ sport, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(opioid ~ sunscreen, design = nhis, family = quasibinomial, na.action = na.omit)
+tidy1 <- tidy(model1, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c(31124-length(model2$residuals), 
+           31124-length(model3$residuals),31124-length(model1$residuals), 
+           31124-length(model4$residuals),31124-length(model4$residuals), 
+           31124-length(model5$residuals), 31124-length(model5$residuals) )
+knitr::kable(cbind(bind_rows(tidy2, tidy3, tidy1, tidy4, tidy5), missing), digits=2,
+             caption="life style: odds ratios for opioid use", align="l")
+```
+
+**Smoking** at least 100 cigarettes during a lifetime had an odds ratio of 2.85.   
+**Drinking at least one alcoholic drink** in a lifetime had an odds ratio of 1.52.
+**Heavy drinking** (had 4+/5+ drinks per one occasion in the past year) had an odds ratio of 0.56 (CI=0.45-0.7).  
+Level of **physical activity** (OR=0.26, 0.52) had 31 missing values for opioid users.  
+**Using sunscreen** (OR=1.2, 1.55) had 19 missing values for opioid users.  
+
+### Mental health
+
+```{r}
+#mental health
+
+model1 <- svyglm(cpain ~ support, design = nhis, family = quasibinomial, na.action = na.omit)
+model2 <- svyglm(opioid ~ anx_freq, design = nhis, family = quasibinomial, na.action = na.omit)
+model3 <- svyglm(opioid ~ anx_level, design = nhis, family = quasibinomial, na.action = na.omit)
+model4 <- svyglm(opioid ~ anx_med, design = nhis, family = quasibinomial, na.action = na.omit)
+model5 <- svyglm(opioid ~ depr_freq, design = nhis, family = quasibinomial, na.action = na.omit)
+model6 <- svyglm(opioid ~ depr_level, design = nhis, family = quasibinomial, na.action = na.omit)
+model7 <- svyglm(opioid ~ depr_med, design = nhis, family = quasibinomial, na.action = na.omit)
+model8 <- svyglm(opioid ~mhrx , design = nhis, family = quasibinomial, na.action = na.omit)
+tidy1 <- tidy(model1, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy2 <- tidy(model2, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy3 <- tidy(model3, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy4 <- tidy(model4, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy5 <- tidy(model5, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy6 <- tidy(model6, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy7 <- tidy(model7, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+tidy8 <- tidy(model8, exponentiate=TRUE,conf.int = TRUE)[-1, -c(3, 4)]
+missing<-c(31124-length(model1$residuals),31124-length(model1$residuals), 31124-length(model1$residuals), 31124-length(model1$residuals),
+           31124-length(model2$residuals), 
+           31124-length(model3$residuals), 31124-length(model3$residuals), 
+           31124-length(model4$residuals), 
+           31124-length(model5$residuals), 
+           31124-length(model6$residuals), 31124-length(model6$residuals),
+           31124-length(model7$residuals), 31124-length(model8$residuals))
+knitr::kable(cbind(bind_rows(tidy1, tidy2, tidy3, tidy4, tidy5, tidy6, tidy7, tidy8), missing), digits=2,
+             caption="Mental health: odds ratios for opioid use", align="l")
+```
+
+Getting **social support** shows significant associations to opioid use (OR=1.67, 2.26, 1.5, 1.2), but has several levels that can't be unified and a lot of missing data (which has its own level). Sensitivity analysis was carried out to examine this predictor's contribution to the model.  
+Anxiety and depression are associated to opioid use.   
+**Daily/weekly feelings of anxiety or depression** had an OR of 2.1 and 3.17, respectively, compared to less frequent feelings.  
+**High levels of anxiety and depression** had a higher odds ratio (OR=3.7 and 2.92), meaning that people who reported higher levels of anxiety and depression were more likely to use opioids.  
+**Taking medication for anxiety or depression** also had a higher odds ratio (OR=3.66, 4.24).  
+**Taking other prescription medication for mental health** had a lower odds ratio (OR=1.38).  
+
+### Interactions 
+Interactions between demographic and clinical characteristics and other predictors were tested by weighted logistic regression on the survey design.  
+The interaction between age of 65+ years and general health is illustrated in the plot below. 
+
+```{r}
+#under 65 have lower odds for excellent-good, but the same as 65+ for fair+poor
+m3<-svyglm(opioid~ age65*health, family=quasibinomial, design=nhis, na.action = na.omit)
+emmip(m3,  age65~health, CIs=TRUE, plotit=T)+theme_bw()
+
+```
+
+We can see that people under 65 (pink) whose health is excellent/very good/good are less likely to use opioids compared to people who are 65+ years old. However, for health statuses "Fair" and "Poor" people under 65 have the same odd of using prescription opioids as people who are 65+ years old. 
+
+### Summary
+Our predictors show significant associations with opioid use. Missing data proportions are negligible. Multi-level predictors demonstrate a noticeable difference in odds ratios between levels, which validates our data preparation process. The associations between opioid use and the predictors are very similar in direction and magnitude to those between chronic pain and those same predictors. This might be due to the fact that opioid use is correlated to chronic pain, and has a relatively small occurrence in the cohort (4%).  
+The strongest predictors are related to health, disability and participation, while life style factors appear to be secondary. 
+
+
+## Model fitting 
+For our prediction models we used weighted logistic regression, with the above-mentioned predictors and interactions. Models with and without predictors sunscreen and sport were compared, to investigate if their contribution was worth losing opioid users' observations due to missing values.  
+Interactions were tested according to clinical relevance, and the interactions which had the highest odds-ratio ratio were used in the models. models' assumptions were met.  
+
+### Model evaluation methods
+Our outcome variable has unbalanced classes: 4% of our cohort are opioid users (1,241 respondents) and 96% are not (29,883 respondents).  
+To compare our models and choose the best fit we used weighted ROC curves and our comparison metric will be the area under the curve, which is well-suited for unbalanced data.   
+
+Several models with combinations of predictors and different interactions were tested using a stratified train and test set. We split our cohort randomly to a train set and a test set, while making sure each set has 4% opioid users and 96% non-users. 
+
+```{r}
+
+set.seed(123)
+#creating train and test set stratified by opioid use
+yesdata<-cdata%>% filter(opioid=="Yes")#df of opioid users
+nodata<-cdata%>% filter(opioid=="No")# df of non-users
+
+yestraining.samples <- yesdata$opioid %>% createDataPartition(p = 0.8, list = FALSE)
+yestrain.data  <- na.omit(yesdata[yestraining.samples, ])
+yestest.data <- na.omit(yesdata[-yestraining.samples, ])
+
+notraining.samples <- nodata$opioid %>% createDataPartition(p = 0.8, list = FALSE)
+notrain.data  <- na.omit(nodata[notraining.samples, ])
+notest.data <- na.omit(nodata[-notraining.samples, ])
+
+train.data<-bind_rows(yestrain.data, notrain.data)
+test.data<-bind_rows(yestest.data, notest.data)
+
+train.design<-svydesign(id =~PPSU, strata =~PSTRAT,  nest=TRUE, weights=~WTFA_A, data = train.data)
+knitr::kable(cbind(summary(train.data$opioid),summary(test.data$opioid)), 
+    col.names = c("Train set", "Test set"), caption=("Test and train sets by opioid use"), align="l")
+```
+
+38 observations of opioid users (3%) were omitted due to missing data. The train set consisted of a total of 24,544 observations and the test set consisted of 6,149 observations. The 4% rate of opioid users was maintained in the test and train sets. 
+
+The models were fitted on the train set, tested on the test set and their AUC was compared.  
+We will present the 2 models that yielded the highest AUC and compare both models' performance.
+
+## Model performance
+
+### Model 1
+The first model was fitted with all the predictors (models that contained subsets of the predictors did not perform as well).   
+The first model achieved an AUC of 0.917, which is good. According to the ROC curve we can expect high sensitivity and specificity (top left).  
+
+```{r}
+mp<-svyglm(opioid~cpain+sex+age+age65+married+veteran+income_grp+home_owner+uninsured+
+             paybill+payworry+caredelay+foodworry+counseldelay+
+             mobility1+mobility2+communicating+cognitive+work_limited+social_activity+work_lastwk+
+             health+fatigue+injury+dr_12months+wellness+urgent_care+hospitalized+
+             flu_vaccine+cig100+onedrink+drink_heavy+DM_risk+sunscreen+sport+sleep_abnorm+sleep_med+
+             anx_freq+anx_med+anx_level+depr_freq+depr_med+depr_level+mhrx,
+           family=quasibinomial, design=train.design, na.action = na.omit)
+
+#deriving predictions for the test set
+guess<-predict(mp, newdata=test.data, type="response")
+tp.fp<-WeightedROC(guess, test.data$opioid, test.data$WTFA_A)
+auc<-WeightedAUC(tp.fp)#0.94
+thresh<-tp.fp$threshold[which.max(tp.fp$TPR +(1-tp.fp$FPR))]#0.036
+
+ggplot()+ geom_path(aes(FPR, TPR), data=tp.fp)+
+  xlab("True positive rate (sensitivity)")+
+  ylab("False positive rate")+
+  coord_equal()+
+ annotate(geom="text", x=0.5, y=0.5, label="AUC=0.917",
+              color="black")+  ggtitle("Model 1 ROC curve")
+```
+
+
+
+### Model 2
+The second model included these predictors  minus a few redundant predictors and an interaction between age of 65+ years and health.  
+The second model achieved an AUC of 0.919, which is good and slightly better than model 1. 
+
+```{r}
+mp<-svyglm(opioid~age65*health+
+             cpain+sex+age+married+veteran+income_grp+home_owner+uninsured+
+             paybill+payworry+caredelay+foodworry+counseldelay+
+             mobility1+mobility2+communicating+cognitive+social_activity+work_lastwk+work_limited+
+             fatigue+injury+dr_12months+wellness+urgent_care+hospitalized+sleep_abnorm+sleep_med+
+             flu_vaccine+cig100+onedrink+drink_heavy+DM_risk+sunscreen+sport+
+             anx_freq+anx_med+depr_freq+depr_med,
+           family=quasibinomial, design=train.design, na.action = na.omit)
+
+#deriving predictions for the test set
+guess<-predict(mp, newdata=test.data, type="response")
+tp.fp<-WeightedROC(guess, test.data$opioid, test.data$WTFA_A)
+auc<-WeightedAUC(tp.fp)#0.94
+thresh<-tp.fp$threshold[which.max(tp.fp$TPR +(1-tp.fp$FPR))]#0.0356
+
+ggplot()+ geom_path(aes(FPR, TPR), data=tp.fp)+
+  xlab("True positive rate (sensitivity)")+
+  ylab("False positive rate")+
+  coord_equal()+
+ annotate(geom="text", x=0.5, y=0.5, label="AUC=0.919",
+              color="black")+  ggtitle("Model 1 ROC curve")
+
+results<-data.frame(guess)
+predicted.classes <- ifelse(results$response > 0.0356, "Yes", "No")
+#confusionMatrix(as.factor(predicted.classes), test.data$opioid, positive="Yes")
+```
+
+A threshold optimizing both sensitivity and specificity was calculated based on the ROC curve.
+Our **optimal threshold** is 0.0356.
+The model's **sensitivity** is **86%**.   
+The model's **specificity** is **80%**.   
+The model's **balanced accuracy** is **83%**.  
+
+The main clinical relevance in this case is identifying the opioid users. we would rather wrongly identify someone as using prescription opioids (false positive) than miss someone who truly is using them (false negative). In such circumstances, sensitivity is our main concern.   A lower threshold means that more opioid users will be correctly identified by the classifier, but also that more non-users will be wrongly identified an users.  
+The following table presents other thresholds and their respective sensitivity and specificity rates. 
+
+```{r}
+#calculating thresholds for sensitivity 90, 95 and 97%
+#t90<-tp.fp$threshold[0.899<tp.fp$TPR & 0.901>tp.fp$TPR] #0.0256
+#t95<-tp.fp$threshold[0.948<tp.fp$TPR & 0.952>tp.fp$TPR] #0.012
+#t97<-tp.fp$threshold[0.968<tp.fp$TPR & 0.972>tp.fp$TPR] #0.00642
+
+
+#results<-data.frame(guess)
+#predicted.classes <- ifelse(results$response > 0.0558, "Yes", "No")
+#predicted.classes <- ifelse(results$response > 0.00642, "Yes", "No")
+#confusionMatrix(as.factor(predicted.classes), test.data$opioid, positive="Yes")
+#library(MLmetrics)
+#F1_Score(test.data$opioid, predicted.classes, positive="Yes")
+
+Sensitivity<-c(0.86, 0.90, 0.95, 0.97)
+Specificity<-c(0.80, 0.75, 0.65, 0.49 )
+F1_score<-c(0.264, 0.222, 0.183, 0.135)
+Balanced_accuracy<-c(0.83, 0.82, 0.80, 0.73)
+Threshold<-c(0.0356, 0.02, 0.0118, 0.00642)
+df<-cbind(Sensitivity, Specificity, F1_score, Balanced_accuracy, Threshold)
+knitr::kable(df,caption="Model's sensitivity and specificity by threshold", align="l")
+
+```
+
+All in all, our model demonstrates high sensitivity with acceptable specificity.
+
+
+## Model interpretation
+
+We will interpret the second model's coefficients:
+
+```{r}
+export_summs(mp,error_format = "[{conf.low}, {conf.high}]", error_pos=c("right"), 
+             model.names= c("Odds ratios [95% confidence interval]"),
+             confint = TRUE, digits = 2, exp=TRUE, pvals = FALSE, model.info = FALSE, model.fit = FALSE)
+```
+
+The model's coefficients appear as odds ratios with their 95% confidence interval. After controlling for all the above-mentioned factors, these predictors had a statistically significant coefficient (the confidence interval does not include the number 1):  
+
+
+### Health
+**Chronic pain** unsurprisingly had an odds ratio of 7.96 (CI=6.09, 10.42). People suffering chronic pain (having pain most days or every day) are 8 times more likely to use prescription opioids for chronic pain relative to people who are not suffering chronic pain.  
+It was also reasonable to find that people who have **seen a doctor in the past 12 months** were 3 times more likely to use prescription opioids for chronic pain (CI=1.17, 7.64).    
+In the same fashion, people who have **medical insurance** are 2.5 times more likely to use prescription opioids, relative to uninsured individuals (CI=1.40, 4.35).  
+The interaction between age 65+ and health was not statistically significant after controlling for all other variables, but self-reported general health was still a statistically significant predictor of opioid use.  
+**General health** showed increased odds of using opioids for worse health status (on a 1-5 scale, 1 for excellent health and 5 for poor).  
+Compared to "Excellent" health status (1/5):  
+Respondents whose health was "Good" (3/5) were 2.34 times more likely to use opioids (CI=1.33, 4.11).  
+Respondents whose health was "Fair" (4/5) were 3.09 times more likely to use opioids (CI=1.73, 5.52).  
+Respondents whose health was "Poor" (5/5) were 3.57 times more likely to use opioids (CI=1.80, 7.09).  
+**Using sleep medication** was associated with opioid use, with an 83% increased odd for people using sleep medication some days (OR=1.83, CI=1.41, 2.38), and 72% increased odd for people taking them most days or every day (OR=1.73, CI=1.38, 2.17), compared to people who do not use sleep medication at all.  
+Having had a **flu vaccine** was also associated with a 24% increased odd of using opioids (OR=1.24, CI=1.01, 1.53).   
+Additional health-related factors that were not statistically significant are fatigue, having had a wellness doctor's visit, having had urgent care, being hospitalized, being at risk for diabetes and having abnormal amount of sleep.
+
+### Disability and participation
+Difficulty in **mobility (walking/climbing stairs)** was significantly correlated to using prescription opioids.  
+People who reported **some difficulty** were 32% more likely to use opioids than people who had no difficulty (OR=1.32, CI=1.02, 1.70).   
+People who reported **a lot of difficulty** were 76% more likely to use opioids than people who had no difficulty (OR=1.76, CI=1.23, 2.51).  
+Reporting no difficulty in **cognitive tasks** (memory and concentration) was associated with a 72% increased odd for opioid use (OR=1.72, CI=1.10, 2.70) compared to those who reported a lot of difficulty.  
+Having a **chronic pain that limits the amount or type of work you can do** is associated with a 41% increased odd of using opioids (OR= 1.41, CI=1.10, 1.80).  
+Not having **worked in the last week** had an odds ratio of 1/0.68=1.47 (CI=1.14, 1.89), meaning they have a 47% increased odd for opioid use compared to people who did work in the last week.  
+Difficulty in communication or participation in social activity were not statistically significant predictors.  
+
+### Demographics
+**Age** had a very weak association to opioid use (OR=1.01, CI=1.00, 1.02), each year of age is associated to a 1% increased odd for opioid use (for example, 10% increase for 10 years of age).
+Other factors were not statistically significant: sex, marital status, military service, income level and home ownership status.
+
+### Life style
+**Smoking** at least 100 cigarettes in a lifetime was associated with a 35% increased odd of using opioids (OR=1.35, CI=1.12, 1.63).  
+Other life style factors that were not statistically significant are having at least one drink in a lifetime, binge drinking, physical activity, using sunscreen
+
+### Financial concerns
+Worrying or having trouble paying medical bills, worrying about food security, delaying care or counsel because of financial difficulty- all these variables were not statistically significant. 
+
+### Mental health
+Anxiety and depression frequency or medication were not statistically significant after controlling for all other variables.  
+
+## Conclusions
+Our prediction model achieved an AUC of 0.919, with a **balanced accuracy of 0.83**. Our model's **sensitivity was 0.86 and specificity was 0.80**, or with a threshold prioritizing sensitivity: sensitivity=0.95, specificity=0.68.
+
+The strongest predictors are more indicative of the way opioid prescriptions are given: one would be more likely to use prescription opioids if one was suffering chronic pain (OR=7.96), had medical insurance (OR=2.5), and had seen a doctor in the last 12 months (OR=3).   
+People who reported a lot of difficulty in cognitive skills (memory and concentration) were less likely to receive prescription opioids compared to people who reported no difficulty (OR=0.56). This might be indicative of physicians' caution in prescribing opioids to vulnerable patients, due to the risk of opioid-induced cognitive impairment. 
+Other significant variables were mostly related to health, disability and work participation:
+Self-reported general health had increasing odds for opioid usage for worse levels of health (OR=2.34, 3.09, 3.57). Using sleep medication (OR=1.83, 1.73), getting a flu vaccine (OR=1.24). Mental health factors were not statistically significant.     
+Difficulty in mobility (OR=1.32, 1.76) and work participation (OR=1.41, 1.47) were also strong predictors of opioid usage, with increased odds for higher levels of disability.  
+Life style factors were not statistically significant, except for smoking (OR=1.35).    
+Socio-demographic factors such as sex, income and marital status were not statistically significant.
+Age showed a very weak association to opioid use (OR=1.01, CI=1.01-1.02). In our data analysis process there seemed to be 2 conflicting trends: on one hand, older people were more likely to suffer chronic pain. On the other hand, younger people were more likely to use prescription opioids, possibly because doctors are hesitant in prescribing opioids to older people. These two trends may balance each other, and as a result the odds ratio for age is small.  
+
+
