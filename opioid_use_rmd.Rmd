@@ -1,6 +1,6 @@
 ---
-title: 'Biostatistics projects: project 2'
-Author: "Yael Rosen Lang, ID 035801901"
+title: 'Opioid use and chronic pain'
+Author: "Yael Rosen Lang"
 output:
   rmdformats::readthedown
 ---
@@ -20,6 +20,8 @@ library(jtools)
 library(pander)
 panderOptions("table.split.cells", Inf)
 ```
+By: Yael Rosen Lang
+
 # Abstract
 This study's goal is understanding factors and correlates of chronic pain and opioid usage.
 The analysis was performed on the 2020 National Health Interview Survey (NHIS) conducted by the CDC. The survey data was adjusted for age, race/ethnicity, and sex to prevent bias due to sample imbalance.       
@@ -31,7 +33,7 @@ Our prediction model for prescription opioid usage achieved a sensitivity of 86%
 
 ```{r}
 library("readxl")
-ndata=read.csv(file='F:/My Documents/MPH/Biostatistics_projects/2 Survey/adult20.csv')
+ndata=read.csv(file='C:/Users/user/Desktop/yael/MPH/Biostatistics_projects/2 Survey/adult20.csv')
 
 #filtering out refused/dont know/not ascertained from vars chronic pain and opioid use
 data<-ndata%>%filter(PAIFRQ3M_A<6)
